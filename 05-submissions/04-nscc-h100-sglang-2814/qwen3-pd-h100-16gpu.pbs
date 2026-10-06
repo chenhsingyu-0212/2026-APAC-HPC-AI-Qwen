@@ -1,0 +1,368 @@
+#!/bin/bash
+#PBS -N qwen3-pd-2706
+#PBS -P 59010033
+#PBS -l select=2:ncpus=112:ngpus=8
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#
+# Qwen3-235B-A22B-Instruct-2507-FP8, prefill/decode disaggregated, 16x H100 80GB.
+# NSCC ASPIRE 2A+ (PBS Pro). Deployment and the official AIPerf command are
+# consecutive steps of this one job, as the task rules require.
+#
+# MEASURED: 2,706 good output tokens/s at concurrency 72, good_request_fraction
+# 0.976, TTFT p90 1,371 ms, ITL p90 19.23 ms. Job 215675, 2026-10-02, official
+# window (60 s warm-up / 120 s benchmark / 30 s grace).
+#
+# This is a Basic-tier configuration. No speculative decoding, no quantisation
+# beyond the checkpoint's own FP8, KV cache at bf16 (higher precision than the
+# rules' FP8 floor). Four things differ from a default deployment, all of them on
+# the rules' allowed list, and each is justified where it is set:
+#
+#   1. 2x TP4 prefill + 2x TP4 decode        the only split that fits 80 GB
+#   2. NO expert parallelism on decode       SGLang defaults --ep-size to the TP
+#                                            degree for a PD decode worker; two
+#                                            independent TP4 groups measured 2.27x
+#                                            better (986 -> 2,240 good tok/s)
+#   3. integer CUDA_VISIBLE_DEVICES          PBS hands out GPU UUIDs, SGLang parses
+#                                            them with int(), and custom all-reduce
+#                                            silently falls back to NCCL. Worth 6.3%
+#   4. DeepGEMM MoE on PREFILL ONLY          +10.7%, and free: in PD the two roles
+#                                            are separate processes, so decode never
+#                                            pays DeepGEMM's per-step cost
+#
+# Verify tiers 1 and 2 from the logs afterwards with ./verify-basic.sh <rundir>.
+set -uo pipefail
+
+# ------------------------------------------------------------------ parameters
+SCRATCH=${SCRATCH:-/scratch/users/industry/ai-hpc/$USER}
+MODEL=${MODEL:-$SCRATCH/models/Qwen3-235B-A22B-Instruct-2507-FP8}
+VENV=${VENV:-$SCRATCH/envs/sglang}
+# The client is its OWN venv. Job 215695 defaulted this to $VENV/bin/aiperf, loaded
+# 221 GB across sixteen GPUs, brought four workers to healthy, and then exited 127 on
+# a path that never existed -- fifteen minutes to discover a typo.
+AIPERF=${AIPERF:-$SCRATCH/envs/client/bin/aiperf}
+RUNDIR=${RUNDIR:-${PBS_O_WORKDIR:-$PWD}/runs/${PBS_JOBID%%.*}}
+
+# 80, NOT 88, and the difference is the whole lesson of job 216159.
+#
+# A 12,288-token prefill batch raises prefill's service rate from 13.89 to 14.72 req/s,
+# and the saturating concurrency rises with it, so the throughput peak moved up: job
+# 216132 measured 2,834 at N=88 against 2,814 at 80 and 2,686 at 72 -- and that 2,686
+# is BELOW what this configuration without the big batch scores at 72 (2,710), because
+# a prefill-capacity lever pays nothing below the old saturation point.
+#
+# But 216159 re-ran this exact configuration on the same two nodes and N=88 came back
+# at pass **0.880** against 216132's 0.962. 0.880 is under the 0.90 gate, which scores
+# the reference floor instead of 2,834. Not thermal and not cell order: the decode node
+# held 1980 MHz in both windows at 52.5 C and 50.8 C, and average ITL was 19.0 ms both
+# times. What moved was the TAIL -- this configuration sits at 95% of the ITL budget and
+# whether the tail crosses 20 ms is not stable run to run.
+#
+#     N=88   pass 0.962 then 0.880     <- one run below the gate
+#     N=80   pass 0.960 then 0.930     <- both runs clear it
+#
+# So the declarable point is 80. 2,814 and 2,742 were measured there. Raise this only
+# against evidence that the ITL tail has been given room.
+N=${N:-80}                      # the declared concurrency
+TP=${TP:-4}                     # per worker, on both roles
+CPUS=${CPUS:-24}                # OMP threads per worker
+# PER ROLE, because the two roles want opposite things from it. mem_fraction_static
+# sizes the KV pool and whatever is left over is the activation and kernel workspace.
+#
+# A decode worker holds 200 output tokens for every request it is serving and wants the
+# pool as large as it can get: 0.85, not 0.90, because DeepGEMM's masked-layout
+# workspace wants ~2.75 GiB and 0.90 leaves 2.59, which OOMs on the first batch.
+#
+# A disaggregated prefill worker holds each request's KV only until the decode side
+# pulls it, and job 215960 measured what that costs: over ~1,250 Prefill-batch steps
+# per worker the pool's `token usage` sat at 0.11-0.13 and peaked at 0.19 -- including
+# the first-ten-seconds burst where every one of our TTFT failures happens. The pool is
+# five times larger than the job needs, and what it starves is the thing we want:
+#
+#   Available memory 9.70GB is less than required memory 16.94GB for warmup,
+#   reducing max_m to 8192 to avoid out of memory
+#
+# DeepGEMM asks for max_m = 2 x max_prefill_tokens and halves it until it fits. At 0.85
+# a 12,288-token batch halves twice, to 6,144 (job 215921, which is why that run died
+# of OOM). At 0.80 it halves once, to exactly 12,288 -- the batch we asked for. The KV
+# pool that leaves is 8.5 GB against a measured peak of ~0.6 GB.
+MEM_FRACTION=${MEM_FRACTION:-0.85}            # decode
+MEM_FRACTION_PREFILL=${MEM_FRACTION_PREFILL:-0.80}
+# The prefill forward batch. 8192 is SGLang's default and two ISL-4000 requests per
+# forward; 12288 is three, which is +6.0% of prefill service rate. Both flags are
+# needed: --max-prefill-tokens caps the batch independently of --chunked-prefill-size,
+# so raising one and not the other leaves the batch where it was.
+CHUNKED_PREFILL=${CHUNKED_PREFILL:-12288}
+CONTEXT_LEN=${CONTEXT_LEN:-8192}
+MAX_RUNNING=${MAX_RUNNING:-256}
+ROUTER_PORT=${ROUTER_PORT:-8000}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-1800}
+
+mkdir -p "$RUNDIR" || { echo "x cannot create $RUNDIR" >&2; exit 1; }
+say() { echo "[$(date +%H:%M:%S)] $*"; }
+
+# EVERY PATH, BEFORE ANY GPU WORK. The model load is ten minutes and the bring-up is
+# four workers; a wrong path found after that is the whole allocation wasted, which
+# is what happened to 215695.
+for _p in "$MODEL/config.json" "$VENV/bin/python3" "$AIPERF"; do
+    [[ -r "$_p" ]] || { echo "x missing: $_p" >&2; exit 1; }
+done
+"$AIPERF" --version >/dev/null 2>&1 || { echo "x $AIPERF does not run" >&2; exit 1; }
+"$VENV/bin/python3" -c 'import sglang' 2>/dev/null \
+    || { echo "x $VENV/bin/python3 cannot import sglang" >&2; exit 1; }
+say "paths ok: model, engine venv, client"
+
+
+# ------------------------------------------------------------------ the nodes
+[[ -r "${PBS_NODEFILE:-}" ]] || { echo "x no PBS_NODEFILE -- run this under qsub" >&2; exit 1; }
+mapfile -t NODES < <(awk '!seen[$0]++' "$PBS_NODEFILE")
+(( ${#NODES[@]} >= 2 )) || { echo "x need 2 nodes, got ${#NODES[@]}" >&2; exit 1; }
+PNODE="${NODES[0]}"; DNODE="${NODES[1]}"
+PIP="$(getent ahostsv4 "$PNODE" | awk 'NR==1{print $1}')"
+DIP="$(getent ahostsv4 "$DNODE" | awk 'NR==1{print $1}')"
+[[ -n "$PIP" && -n "$DIP" ]] || { echo "x cannot resolve the nodes to IPv4" >&2; exit 1; }
+say "prefill on $PNODE ($PIP), decode on $DNODE ($DIP)"
+
+rsh() { ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$1" "bash -c '$2'"; }
+
+for n in "${NODES[@]}"; do
+    rsh "$n" "true" || { echo "x $n does not answer ssh" >&2; exit 1; }
+done
+
+# --------------------------------------------- GPU ids: UUIDs become integers
+#
+# PBS exports CUDA_VISIBLE_DEVICES as a list of GPU UUIDs. SGLang reads that
+# variable and calls int() on it when it sets up custom all-reduce; the call
+# throws, it warns once per rank --
+#
+#   Setup Custom allreduce failed with invalid literal for int() with base 10:
+#   GPU-3f70e3fb-6c96-fa36-b623-d77b30e3b686
+#
+# -- and every collective falls back to NCCL for the life of the job. Handing it
+# integers instead is worth 6.3% here, all of it on prefill (11.20 -> 11.90 req/s).
+#
+# The integer has to be the GPU's POSITION in the node's enumeration, not the
+# index nvidia-smi reports: when a cgroup exposes a subset the driver renumbers
+# from zero, and then the reported index would be wrong while the position is
+# right either way.
+gpu_indices() {   # $1=node -- prints one integer per GPU, in PBS's order
+    rsh "$1" '
+order=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d " " | sed "/^$/d")
+mapfile -t ord <<< "$order"
+ids=${CUDA_VISIBLE_DEVICES:-}
+if [ -z "$ids" ]; then for k in "${!ord[@]}"; do echo "$k"; done; exit 0; fi
+IFS=, read -r -a toks <<< "$ids"
+for t in "${toks[@]}"; do
+    [ -n "$t" ] || continue
+    found=
+    for k in "${!ord[@]}"; do if [ "${ord[$k]}" = "$t" ]; then found=$k; break; fi; done
+    if [ -n "$found" ]; then echo "$found"; else echo "$t"; fi
+done'
+}
+
+mapfile -t PGPU < <(gpu_indices "$PNODE")
+mapfile -t DGPU < <(gpu_indices "$DNODE")
+(( ${#PGPU[@]} == 8 && ${#DGPU[@]} == 8 )) || {
+    echo "x expected 8 GPUs per node, got ${#PGPU[@]} and ${#DGPU[@]}" >&2; exit 1; }
+P0="$(IFS=,; echo "${PGPU[*]:0:4}")"; P1="$(IFS=,; echo "${PGPU[*]:4:4}")"
+D0="$(IFS=,; echo "${DGPU[*]:0:4}")"; D1="$(IFS=,; echo "${DGPU[*]:4:4}")"
+say "prefill GPUs $P0 and $P1; decode GPUs $D0 and $D1"
+
+# ------------------------------------------------------------------ the worker
+#
+# Written to shared scratch so both nodes read the same file. It sets up what the
+# engine needs and then runs it; the engine's flags are built here rather than
+# passed through ssh, so no argument has to survive a remote shell's quoting.
+cat > "$RUNDIR/worker.sh" <<'WORKER'
+#!/bin/bash
+set -uo pipefail
+role="$1"; port="$2"; boot="${3:-}"
+: "${MODEL:?}" "${VENV:?}" "${TP:?}" "${MEM_FRACTION:?}" "${CONTEXT_LEN:?}" "${MAX_RUNNING:?}"
+: "${MEM_FRACTION_PREFILL:?}" "${CHUNKED_PREFILL:?}"
+
+# NIXL moves the KV cache between nodes over UCX, and UCX has to be pointed at
+# the right HCA: an Ethernet or RoCE device on the same host would otherwise land
+# in UCX_NET_DEVICES and the transfer would leave over the wrong fabric. Detect
+# per node, because the two do not have to enumerate their devices alike. Match
+# the state string exactly rather than as a substring, and fail loudly when
+# nothing matches instead of letting UCX choose.
+IB="$(for d in /sys/class/infiniband/*; do
+        [ "$(cat "$d/ports/1/link_layer" 2>/dev/null)" = InfiniBand ] || continue
+        [ "$(cat "$d/ports/1/state" 2>/dev/null)" = "4: ACTIVE" ] || continue
+        rate="$(awk '{print int($1)}' "$d/ports/1/rate" 2>/dev/null)"
+        [ "${rate:-0}" -ge 400 ] || continue      # the NDR fabric only; this node
+        echo "$(basename "$d"):1"                 # also has 200 Gb/s storage HCAs
+      done | paste -sd,)"
+[ -n "$IB" ] || { echo "[$(hostname)] FATAL: no active 400 Gb/s IB" >&2; exit 1; }
+export UCX_NET_DEVICES="$IB" UCX_POSIX_USE_PROC_LINK=n
+
+# 1024 descriptors is the default here and it is not enough for a serving stack.
+[ "$(ulimit -n)" -lt 65535 ] 2>/dev/null && ulimit -n 65535 2>/dev/null
+
+# Per-worker compile caches on node-local disk: two workers share a node and
+# would otherwise race on the same Triton and Inductor directories.
+export TRITON_CACHE_DIR="/tmp/pdw-$role-$port/triton"
+export TORCHINDUCTOR_CACHE_DIR="/tmp/pdw-$role-$port/inductor"
+mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
+
+# A pip venv carries no CUDA toolkit on PATH and no Python headers, and DeepGEMM
+# and Triton both compile at runtime. Without these the engine loads the whole
+# 221 GB checkpoint and then dies in nvcc.
+CU="$VENV/lib/python3.10/site-packages/nvidia/cu13"
+export CUDA_HOME="$CU" CUDA_PATH="$CU"
+export PATH="$CU/bin:$VENV/bin:$PATH"
+export CPATH="${PYINC:-}${PYINC:+:}$CU/include:$CU/include/cccl${CPATH:+:$CPATH}"
+export LD_LIBRARY_PATH="${PYLIB:-}${PYLIB:+:}${LD_LIBRARY_PATH:-}"
+export LIBRARY_PATH="${PYLIB:-}${PYLIB:+:}${LIBRARY_PATH:-}"
+
+cmd=( "$VENV/bin/python3" -m sglang.launch_server
+      --model-path "$MODEL" --served-model-name qwen --trust-remote-code
+      --context-length "$CONTEXT_LEN" --tp-size "$TP"
+      --mem-fraction-static "$([ "$role" = prefill ] && echo "$MEM_FRACTION_PREFILL" || echo "$MEM_FRACTION")"
+      --disaggregation-mode "$role" --disaggregation-transfer-backend nixl
+      --enable-metrics
+      # The benchmark gives every request a different prefix, so prefix reuse can
+      # never hit. It is off in the ENGINE because the installed AIPerf has no
+      # --cache-bust; see README, deviation 1.
+      --disable-radix-cache )
+
+if [ "$role" = prefill ]; then
+    # DeepGEMM's FP8 grouped GEMM, on the prefill role only. Prefill runs
+    # 4,008-token batches and is GEMM-bound, where DeepGEMM is 1.23x Triton;
+    # decode runs batches of tens and is latency-bound, where it is 1.3-1.5x
+    # SLOWER. In PD those are different processes, so this buys the first without
+    # paying the second.
+    cmd+=( --moe-runner-backend deep_gemm )
+    # First USE of a DeepGEMM cubin does a module load, and a module load inside a
+    # CUDA-graph capture is illegal -- the engine dies with "markCaptureEnd called
+    # with no captures in progress". Pre-compiling the kernels does not help,
+    # because the trigger is the load and not the build. SGLang's own
+    # compile_deep_gemm resolves it the same way: no prefill graphs. They are worth
+    # little at 4,008 tokens a batch, and decode's graphs are untouched.
+    cmd+=( --disable-prefill-cuda-graph )
+    # THE BIG PREFILL BATCH, on the prefill role only -- a decode worker has no use
+    # for it. Three ISL-4000 requests per forward instead of two. Measured +4.6% on the
+    # score and +6.0% on prefill's service rate (job 216132, paired against a control
+    # in the same allocation). It needs MEM_FRACTION_PREFILL above to be 0.80, or
+    # DeepGEMM halves max_m to 6,144 and the batch silently reverts.
+    cmd+=( --chunked-prefill-size "$CHUNKED_PREFILL"
+           --max-prefill-tokens "$CHUNKED_PREFILL" )
+    cmd+=( --disaggregation-bootstrap-port "$boot" )
+else
+    # NO --ep-size. SGLang defaults it to the TP degree for a PD decode worker,
+    # and expert parallelism trades an all-reduce for an all-to-all that costs
+    # 4.3-5.2 ms per step at this batch size: 188 dispatch/combine collectives at
+    # a ~25 us floor. Two independent TP4 groups measured 2.27x better.
+    cmd+=( --max-running-requests "$MAX_RUNNING" )
+fi
+cmd+=( --host 0.0.0.0 --port "$port" )
+
+echo "[$(hostname)] $role port=$port gpus=${CUDA_VISIBLE_DEVICES:-<unset>} ib=$IB"
+echo "[$(hostname)] exec: ${cmd[*]}"
+exec "${cmd[@]}"
+WORKER
+chmod +x "$RUNDIR/worker.sh"
+
+# ------------------------------------------------------------------ bring-up
+PYINC="$SCRATCH/stage/pyinclude/python3.10:$SCRATCH/stage/pyinclude"
+PYLIB="$SCRATCH/stage/pylib"
+ENVS="MODEL=$MODEL VENV=$VENV TP=$TP MEM_FRACTION=$MEM_FRACTION \
+MEM_FRACTION_PREFILL=$MEM_FRACTION_PREFILL CHUNKED_PREFILL=$CHUNKED_PREFILL \
+CONTEXT_LEN=$CONTEXT_LEN MAX_RUNNING=$MAX_RUNNING PYINC=$PYINC PYLIB=$PYLIB"
+
+launch() {   # $1=node $2=ids $3=role $4=port $5=bootstrap-port
+    local node="$1" ids="$2" role="$3" port="$4" boot="${5:-}"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" \
+        "export CUDA_VISIBLE_DEVICES=$ids OMP_NUM_THREADS=$CPUS $ENVS; \
+         exec bash $RUNDIR/worker.sh $role $port $boot" \
+        > "$RUNDIR/$role-$port.log" 2>&1 &
+    echo "  $role-$port -> $node gpus=$ids"
+}
+
+PORTS=(30100 30101 30200 30201)
+cleanup() {
+    local n pt
+    for n in "${NODES[@]}"; do
+        for pt in "${PORTS[@]}" "$ROUTER_PORT"; do
+            rsh "$n" "pkill -u \$(id -u) -f -- '--port +${pt}( |\$)' 2>/dev/null; true" >/dev/null 2>&1
+        done
+        # Killing the server does not kill the sglang::scheduler_TP* children it
+        # forked, and those hold ~19 GB of HBM each. Ask the driver who is still
+        # holding memory, and only touch our own processes.
+        rsh "$n" '
+me=$(id -u)
+for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d " "); do
+    [ -d /proc/$p ] || continue
+    [ "$(stat -c %u /proc/$p 2>/dev/null)" = "$me" ] || continue
+    kill -TERM $p 2>/dev/null
+done; sleep 5
+for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d " "); do
+    [ -d /proc/$p ] || continue
+    [ "$(stat -c %u /proc/$p 2>/dev/null)" = "$me" ] || continue
+    kill -9 $p 2>/dev/null
+done; true' >/dev/null 2>&1
+    done
+}
+trap cleanup EXIT INT TERM
+
+say "launching 4 workers"
+launch "$PNODE" "$P0" prefill 30100 9000
+launch "$PNODE" "$P1" prefill 30101 9001
+launch "$DNODE" "$D0" decode  30200
+launch "$DNODE" "$D1" decode  30201
+
+wait_health() {   # $1=url  $2=label
+    local t0=$SECONDS
+    until curl -sf -m 5 "$1" >/dev/null 2>&1; do
+        (( SECONDS - t0 > HEALTH_TIMEOUT )) && { echo "x $2 unhealthy after ${HEALTH_TIMEOUT}s" >&2; return 1; }
+        sleep 5
+    done
+    say "  $2 healthy after $(( SECONDS - t0 ))s"
+}
+wait_health "http://$PIP:30100/health" prefill-30100 || exit 1
+wait_health "http://$PIP:30101/health" prefill-30101 || exit 1
+wait_health "http://$DIP:30200/health" decode-30200  || exit 1
+wait_health "http://$DIP:30201/health" decode-30201  || exit 1
+
+# ROUTING POLICY. sglang_router defaults to cache_aware, and on this benchmark
+# that is the worst available choice: of four prefill workers one took 126
+# requests and the other three one apiece, and a 60 s warm-up ran for 503 s. Every
+# request carries a different prefix here, so cache affinity buys nothing and
+# costs the load balance. Routing is explicitly on the rules' allowed list.
+say "launching the router"
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$PNODE" \
+    "export CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=2 PATH=$VENV/bin:\$PATH; \
+     exec $VENV/bin/python3 -m sglang_router.launch_router --pd-disaggregation \
+       --prefill http://$PIP:30100 9000 --prefill http://$PIP:30101 9001 \
+       --decode http://$DIP:30200 --decode http://$DIP:30201 \
+       --prefill-policy round_robin --decode-policy round_robin \
+       --host 0.0.0.0 --port $ROUTER_PORT" \
+    > "$RUNDIR/router.log" 2>&1 &
+wait_health "http://$PIP:$ROUTER_PORT/health" router || exit 1
+
+curl -s "http://$PIP:$ROUTER_PORT/v1/models" > "$RUNDIR/models.json"
+say "serving: $(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' "$RUNDIR/models.json" | head -1)"
+
+# ------------------------------------------------- the official AIPerf command
+say "benchmark at concurrency $N"
+"$AIPERF" profile \
+  --artifact-dir "$RUNDIR/artifacts" \
+  --url "http://$PIP:$ROUTER_PORT" \
+  --endpoint-type chat --custom-endpoint /v1/chat/completions \
+  --model-names qwen --ui-type simple \
+  --isl 4000 --isl-stddev 0 --osl 200 --osl-stddev 0 \
+  --tokenizer Qwen/Qwen3-235B-A22B-Instruct-2507 \
+  --streaming --header "Accept: text/event-stream" --api-key NOT_USED \
+  --concurrency "$N" --workers-max "$N" \
+  --warmup-duration 60 --benchmark-duration 120 --benchmark-grace-period 30 \
+  --use-legacy-max-tokens \
+  --extra-inputs min_tokens:200 --extra-inputs ignore_eos:true \
+  --extra-inputs temperature:0.0 \
+  --num-dataset-entries 12800 --random-seed 2026 \
+  --goodput "time_to_first_token:3000 inter_token_latency:20" \
+  2>&1 | tee "$RUNDIR/aiperf.log"
+rc=${PIPESTATUS[0]}
+
+say "aiperf exit $rc -- artefacts in $RUNDIR"
+exit $rc
